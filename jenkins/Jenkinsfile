@@ -1,0 +1,41 @@
+// Alternative to GitHub Actions. Requires Jenkins with Docker, NodeJS and credentials:
+//   dockerhub-creds (username/password), server-ssh (SSH key), plus env SERVER_HOST / SERVER_USER
+pipeline {
+  agent any
+  environment {
+    IMAGE = "YOUR_DOCKERHUB_USER/task-tracker"
+    TAG   = "${env.GIT_COMMIT.take(7)}"
+  }
+  stages {
+    stage('Test')  { steps { dir('app') { sh 'npm install && npm run lint && npm test' } } }
+    stage('Build') { steps { sh 'docker build -t $IMAGE:$TAG -t $IMAGE:latest --build-arg GIT_SHA=$GIT_COMMIT .' } }
+    stage('Smoke test') {
+      steps {
+        sh '''
+          docker run -d --name ci-app -p 3001:3000 $IMAGE:$TAG
+          sleep 5; ./scripts/smoke-test.sh http://localhost:3001
+        '''
+      }
+      post { always { sh 'docker rm -f ci-app || true' } }
+    }
+    stage('Push') {
+      steps {
+        withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'U', passwordVariable: 'P')]) {
+          sh 'echo $P | docker login -u $U --password-stdin && docker push $IMAGE:$TAG && docker push $IMAGE:latest'
+        }
+      }
+    }
+    stage('Deploy') {
+      when { branch 'main' }
+      steps {
+        sshagent(['server-ssh']) {
+          sh '''
+            scp -o StrictHostKeyChecking=no -r docker-compose.yml scripts $SERVER_USER@$SERVER_HOST:~/task-tracker/
+            ssh -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_HOST "cd ~/task-tracker && IMAGE=$IMAGE:$TAG ./scripts/deploy.sh"
+          '''
+        }
+      }
+    }
+  }
+  post { failure { echo 'Pipeline failed - check the stage logs' } }
+}

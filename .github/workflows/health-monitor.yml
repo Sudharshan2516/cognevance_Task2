@@ -1,0 +1,16 @@
+name: Deployment Health Monitor
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+jobs:
+  check:
+    if: vars.DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check /health and /version
+        run: |
+          curl -fsS --max-time 10 "http://${{ secrets.SERVER_HOST }}/health"
+          echo; curl -fsS --max-time 10 "http://${{ secrets.SERVER_HOST }}/version"

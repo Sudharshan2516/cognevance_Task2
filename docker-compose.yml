@@ -1,0 +1,14 @@
+# Used on the deployment server. IMAGE is set by scripts/deploy.sh (or in .env)
+services:
+  app:
+    image: ${IMAGE:-task-tracker:local}
+    container_name: task-tracker
+    restart: unless-stopped
+    ports:
+      - "${HOST_PORT:-80}:3000"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "5" }

@@ -1,0 +1,13 @@
+{
+  "name": "task-tracker",
+  "version": "1.0.0",
+  "description": "Sample web app for CI/CD pipeline automation",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test --experimental-test-coverage test/*.test.js",
+    "lint": "node --check src/app.js && node --check src/server.js && node --check public/app.js"
+  },
+  "engines": { "node": ">=18" },
+  "dependencies": { "express": "^4.19.2" }
+}

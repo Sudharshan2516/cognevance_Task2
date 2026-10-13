@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Task Tracker | CI/CD Demo</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main class="wrap">
+    <h1>Task Tracker</h1>
+    <p class="sub">Sample app deployed by an automated CI/CD pipeline.</p>
+    <form id="addForm">
+      <input id="title" type="text" placeholder="Add a task..." maxlength="120" required aria-label="Task title">
+      <button type="submit">Add</button>
+    </form>
+    <ul id="list"></ul>
+    <footer>Version <strong id="ver">...</strong> &middot; commit <code id="sha">...</code></footer>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>
