@@ -12,10 +12,10 @@ permissions:
   contents: read
 
 env:
-  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/task-tracker
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  ECR_REPOSITORY: task-tracker
 
 jobs:
-  # ---------- Stage 1: lint + test ----------
   test:
     name: Lint and test (Node ${{ matrix.node }})
     runs-on: ubuntu-latest
@@ -43,7 +43,6 @@ jobs:
           grep -E "^# (tests|pass|fail)|all files" test-output.txt >> $GITHUB_STEP_SUMMARY || true
           echo '```' >> $GITHUB_STEP_SUMMARY
 
-  # ---------- Stage 2: build image, scan, smoke test ----------
   build:
     name: Build, scan and smoke-test image
     needs: test
@@ -75,7 +74,7 @@ jobs:
           image-ref: task-tracker:ci
           severity: CRITICAL,HIGH
           ignore-unfixed: true
-          exit-code: "0"        # report only; set to 1 to block on findings
+          exit-code: "0"
       - name: Run container and smoke-test it
         run: |
           docker run -d --name ci-app -p 3000:3000 task-tracker:ci
@@ -84,71 +83,76 @@ jobs:
           docker logs ci-app
           docker stop ci-app
 
-  # ---------- Stage 3: publish to Docker Hub ----------
   publish:
-    name: Push image to Docker Hub
+    name: Push image to Amazon ECR and deploy ECS
     needs: build
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: aws-actions/configure-aws-credentials@v4
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - uses: docker/metadata-action@v5
-        id: docker_meta
-        with:
-          images: ${{ env.IMAGE_NAME }}
-          tags: |
-            type=sha,format=short
-            type=ref,event=tag
-            type=raw,value=latest,enable={{is_default_branch}}
-      - uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: true
-          tags: ${{ steps.docker_meta.outputs.tags }}
-          labels: ${{ steps.docker_meta.outputs.labels }}
-          build-args: |
-            APP_VERSION=${{ github.ref_name }}
-            GIT_SHA=${{ github.sha }}
-            BUILD_DATE=${{ needs.build.outputs.tag }}
-          cache-from: type=gha
-      - name: Summary
+          role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: hashicorp/setup-terraform@v3
+      - name: Create ECR repository
+        working-directory: infra
         run: |
-          echo "### Image published" >> $GITHUB_STEP_SUMMARY
-          echo "${{ steps.docker_meta.outputs.tags }}" | sed 's/^/- `/; s/$/`/' >> $GITHUB_STEP_SUMMARY
+          terraform init -input=false
+          terraform apply -auto-approve -input=false \
+            -target=aws_ecr_repository.app \
+            -var="aws_region=${AWS_REGION}" \
+            -var="github_repository=${GITHUB_REPOSITORY}" \
+            -var="image_uri=bootstrap"
+      - name: Login to ECR
+        id: ecr
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          echo "registry=${REGISTRY}" >> "$GITHUB_OUTPUT"
+          aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$REGISTRY"
+      - name: Build and push image
+        id: image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          IMAGE_URI="${REGISTRY}/${ECR_REPOSITORY}:${{ needs.build.outputs.tag }}"
+          docker build \
+            --build-arg APP_VERSION="${GITHUB_REF_NAME}" \
+            --build-arg GIT_SHA="${GITHUB_SHA}" \
+            --build-arg BUILD_DATE="$(date -u +%FT%TZ)" \
+            -t "$IMAGE_URI" .
+          docker push "$IMAGE_URI"
+          echo "uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
+      - name: Apply AWS infrastructure
+        working-directory: infra
+        env:
+          IMAGE_URI: ${{ steps.image.outputs.uri }}
+        run: |
+          terraform apply -auto-approve -input=false \
+            -var="aws_region=${AWS_REGION}" \
+            -var="github_repository=${GITHUB_REPOSITORY}" \
+            -var="image_uri=${IMAGE_URI}"
+      - name: Wait for ECS service
+        run: aws ecs wait services-stable --cluster "$ECR_REPOSITORY" --services "$ECR_REPOSITORY"
+      - name: Publish deployment URL
+        working-directory: infra
+        run: |
+          URL=$(terraform output -raw load_balancer_url)
+          echo "### AWS deployment" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Image: \`${{ steps.image.outputs.uri }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- URL: ${URL}" >> "$GITHUB_STEP_SUMMARY"
 
-  # ---------- Stage 4: deploy to server over SSH ----------
   deploy:
-    name: Deploy to server
+    name: Verify ECS Fargate deployment
     needs: [build, publish]
-    # Enable by setting repository variable DEPLOY_ENABLED=true once your server is ready
     if: github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
     runs-on: ubuntu-latest
     environment: production
     steps:
       - uses: actions/checkout@v4
-      - name: Configure SSH
-        run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -H "${{ secrets.SERVER_HOST }}" >> ~/.ssh/known_hosts
-      - name: Copy deployment files
-        run: |
-          ssh ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} "mkdir -p ~/task-tracker"
-          scp -r docker-compose.yml scripts ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }}:~/task-tracker/
-      - name: Deploy (health check + auto rollback)
-        run: |
-          ssh ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} \
-            "cd ~/task-tracker && IMAGE=${{ env.IMAGE_NAME }}:${{ needs.build.outputs.tag }} ./scripts/deploy.sh"
       - name: Verify deployment from outside
-        run: ./scripts/smoke-test.sh "http://${{ secrets.SERVER_HOST }}"
-      - name: Deployment summary
-        run: |
-          echo "### Deployed" >> $GITHUB_STEP_SUMMARY
-          echo "- Image: \`${{ env.IMAGE_NAME }}:${{ needs.build.outputs.tag }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- URL: http://${{ secrets.SERVER_HOST }}" >> $GITHUB_STEP_SUMMARY
+        run: ./scripts/smoke-test.sh "${{ secrets.AWS_APP_URL }}"

@@ -12,5 +12,5 @@ jobs:
     steps:
       - name: Check /health and /version
         run: |
-          curl -fsS --max-time 10 "http://${{ secrets.SERVER_HOST }}/health"
-          echo; curl -fsS --max-time 10 "http://${{ secrets.SERVER_HOST }}/version"
+          curl -fsS --max-time 10 "${{ secrets.AWS_APP_URL }}/health"
+          echo; curl -fsS --max-time 10 "${{ secrets.AWS_APP_URL }}/version"

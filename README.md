@@ -1,12 +1,12 @@
 # CI/CD Pipeline Automation System
 
 ![CI/CD](https://github.com/USERNAME/cognevance_cicd-pipeline-automation/actions/workflows/ci-cd.yml/badge.svg)
-![Docker Image](https://img.shields.io/docker/v/DOCKERHUB_USER/task-tracker?sort=semver&label=docker%20hub)
+![AWS](https://img.shields.io/badge/AWS-ECR%20%2B%20ECS-orange)
 
 **Cognevance Technologies | Cloud Computing & DevOps | Level 2 (Intermediate)**
-**Author:** YOUR NAME | **Docker Hub:** https://hub.docker.com/r/DOCKERHUB_USER/task-tracker | **Live app:** http://YOUR_SERVER_IP
+**Author:** YOUR NAME | **AWS region:** `us-east-1` | **Live app:** `http://YOUR_ALB_DNS`
 
-A complete CI/CD pipeline that takes a web application from `git push` to a running Docker container: lint, test, build, scan, smoke-test, publish to Docker Hub, deploy to a server, verify, and roll back automatically if the new version is unhealthy.
+A complete AWS-native CI/CD pipeline that takes a web application from `git push` to a running ECS Fargate service: lint, test, build, scan, smoke-test, publish to Amazon ECR, deploy with Terraform, and verify through an Application Load Balancer.
 
 ---
 
@@ -40,9 +40,9 @@ A complete CI/CD pipeline that takes a web application from `git push` to a runn
 | Goal | Automate build, test and deployment of an application |
 | App | Task Tracker (Node.js/Express REST API + web UI) |
 | CI/CD | GitHub Actions (Jenkinsfile provided as alternative) |
-| Containers | Docker multi-stage image, Docker Compose on server |
-| Registry | Docker Hub |
-| Target | Any Ubuntu server with SSH (e.g. AWS EC2 free tier) |
+| Containers | Docker multi-stage image, ECS Fargate |
+| Registry | Amazon ECR |
+| Target | Amazon ECS Fargate behind an Application Load Balancer |
 | Observability | Structured JSON logs, health checks, job summaries, scheduled health monitor |
 
 ## 2. Pipeline architecture
@@ -52,9 +52,9 @@ flowchart LR
   Dev[Developer] -->|git push / PR| GH[(GitHub)]
   GH --> T[1. Lint + Test<br/>Node 18 and 20 matrix]
   T --> B[2. Build image<br/>Trivy scan<br/>container smoke test]
-  B --> P[3. Push to Docker Hub<br/>tags: sha, latest, version]
-  P --> D[4. Deploy over SSH]
-  D --> S[(Server: Docker Compose)]
+  B --> P[3. Push to Amazon ECR<br/>tag: commit SHA]
+  P --> D[4. Terraform deploy]
+  D --> S[(ECS Fargate service)]
   S --> H{Healthy?}
   H -- yes --> OK[Success + summary]
   H -- no --> RB[Automatic rollback to previous image]
@@ -70,9 +70,9 @@ Pull requests run stages 1 and 2 only. Pushes to `main` run all four stages.
 | Testing | Node built-in test runner with coverage |
 | CI/CD | GitHub Actions (also Jenkins) |
 | Containers | Docker, multi-stage build, Docker Compose |
-| Registry | Docker Hub |
+| Registry | Amazon ECR |
 | Security scan | Trivy |
-| Deployment | SSH + Bash scripts |
+| Deployment | Terraform + ECS Fargate |
 | Monitoring | Docker health checks, JSON logs, GitHub job summaries |
 
 ## 4. Repository structure
@@ -87,8 +87,8 @@ cognevance_cicd-pipeline-automation/
 ├── docker-compose.yml            # Server deployment (hardened)
 ├── docker-compose.dev.yml        # Local build and run
 ├── scripts/
-│   ├── deploy.sh                 # Pull, start, health check, auto-rollback
-│   ├── rollback.sh               # Redeploy a previous tag
+│   ├── deploy.sh                 # Legacy local Docker deployment helper
+│   ├── rollback.sh               # Legacy local Docker rollback helper
 │   ├── status.sh                 # Deployment status
 │   ├── logs.sh                   # follow / errors / slow / last N
 │   ├── smoke-test.sh             # End-to-end API check
@@ -135,13 +135,15 @@ docker compose -f docker-compose.dev.yml up --build
 - **Multi-stage build:** stage 1 installs production dependencies, stage 2 copies only what is needed, giving a small image.
 - **Non-root user** (`USER node`) and no dev dependencies or test files in the image.
 - **Build arguments** `APP_VERSION`, `GIT_SHA`, `BUILD_DATE` are stored as image labels and exposed on `/version`.
-- **HEALTHCHECK** calls `/health` every 15 seconds; `deploy.sh` waits for the `healthy` state.
+- **HEALTHCHECK** calls `/health` every 15 seconds; ECS and the ALB use the same endpoint.
 - **Compose hardening:** read-only filesystem, all Linux capabilities dropped, `no-new-privileges`, log rotation (10 MB x 5 files), `restart: unless-stopped`.
 
-Manual build and push:
+Manual build and push to ECR:
 ```bash
-docker build -t DOCKERHUB_USER/task-tracker:1.0.0 --build-arg GIT_SHA=$(git rev-parse HEAD) .
-docker login && docker push DOCKERHUB_USER/task-tracker:1.0.0
+docker build -t task-tracker:1.0.0 --build-arg GIT_SHA=$(git rev-parse HEAD) .
+aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+docker tag task-tracker:1.0.0 "$ECR_REGISTRY/task-tracker:1.0.0"
+docker push "$ECR_REGISTRY/task-tracker:1.0.0"
 ```
 
 ## 8. CI/CD pipeline explained
@@ -151,36 +153,37 @@ File: `.github/workflows/ci-cd.yml`
 |---|---|---|
 | 1 | `test` | Runs on Node 18 and 20 (matrix): install, syntax lint, 6 tests with coverage, results written to the job summary |
 | 2 | `build` | Builds the image (with layer cache), scans with Trivy for HIGH/CRITICAL CVEs, starts the container and runs `smoke-test.sh` against it |
-| 3 | `publish` | Pushes to Docker Hub with tags `sha-xxxxxxx`, `latest` (main) and the Git tag for releases (`v1.0.0`) |
-| 4 | `deploy` | Copies compose file and scripts to the server, runs `deploy.sh` (health check + rollback), then smoke-tests from outside |
+| 3 | `publish` | Pushes the commit-tagged image to Amazon ECR and applies the ECS Fargate Terraform stack |
+| 4 | `deploy` | Runs the smoke test against the ECS Application Load Balancer |
 
 Triggers: push to `main`, tags `v*`, pull requests (stages 1-2), manual run.
 Stage 4 is protected by the `production` environment (add required reviewers for manual approval) and only runs when repository variable `DEPLOY_ENABLED=true`.
 
-## 9. Setup guide: secrets, registry and server
+## 9. Setup guide: AWS, secrets and infrastructure
 
-### 9.1 Docker Hub
-1. Create an account and a repository named `task-tracker`.
-2. Account Settings > Security > **New Access Token** (Read & Write). Copy it.
+### 9.1 AWS infrastructure
+1. Install AWS CLI and Terraform, configure an administrator profile, and choose a region.
+2. Bootstrap the stack:
+   ```bash
+   cd infra
+   terraform init
+   terraform apply -var='github_repository=YOUR_GITHUB_OWNER/cognevance_Task2' -var='image_uri=bootstrap'
+   ```
+3. Save `github_actions_role_arn` as the GitHub secret `AWS_GITHUB_ACTIONS_ROLE_ARN`.
+4. Save `load_balancer_url` as the GitHub secret `AWS_APP_URL`.
+5. Set the repository variable `AWS_REGION` and set `DEPLOY_ENABLED=true`.
 
-### 9.2 Server (AWS EC2 free tier example)
-1. Launch Ubuntu 22.04 `t2.micro`/`t3.micro`; security group: allow **22** (SSH, ideally your IP only) and **80** (HTTP).
-2. SSH in and run `scripts/server-setup.sh` (installs Docker), then log out and in again.
-3. Create a dedicated deploy key on your computer: `ssh-keygen -t ed25519 -f deploy_key -N ""`. Append `deploy_key.pub` to `~/.ssh/authorized_keys` on the server.
-
-> No server? You can still submit a working pipeline: stages 1-3 run without one and prove build, test, scan and registry push. Run the app locally with Docker for your demo screenshots.
+Terraform creates the VPC, public subnets, security groups, ECR repository, ECS cluster/service, Application Load Balancer, CloudWatch log group, and GitHub OIDC role. GitHub Actions does not use SSH keys or long-lived AWS access keys.
 
 ### 9.3 GitHub secrets and variables
 Settings > Secrets and variables > Actions
 
 | Type | Name | Value |
 |---|---|---|
-| Secret | `DOCKERHUB_USERNAME` | Docker Hub username |
-| Secret | `DOCKERHUB_TOKEN` | Docker Hub access token |
-| Secret | `SSH_PRIVATE_KEY` | Contents of `deploy_key` |
-| Secret | `SERVER_HOST` | Server public IP or DNS |
-| Secret | `SERVER_USER` | `ubuntu` |
-| Variable | `DEPLOY_ENABLED` | `true` (after the server is ready) |
+| Secret | `AWS_GITHUB_ACTIONS_ROLE_ARN` | Terraform output `github_actions_role_arn` |
+| Secret | `AWS_APP_URL` | Terraform output `load_balancer_url` |
+| Variable | `AWS_REGION` | AWS region, for example `us-east-1` |
+| Variable | `DEPLOY_ENABLED` | `true` |
 
 Also create an Environment named `production` (Settings > Environments); optionally add yourself as required reviewer.
 
@@ -188,13 +191,13 @@ Also create an Environment named `production` (Settings > Environments); optiona
 ```bash
 git add . && git commit -m "feat: initial CI/CD pipeline" && git push origin main
 ```
-Watch **Actions**, then open `http://SERVER_IP`.
+Watch **Actions**, then open the ALB URL.
 
 ## 10. Deployment scripts
 | Script | Purpose |
 |---|---|
-| `scripts/deploy.sh` | `IMAGE=user/task-tracker:tag ./scripts/deploy.sh`: pulls image, starts via Compose, waits up to 60 s for `healthy`, records the deployed image, prunes old images. On failure prints logs and rolls back |
-| `scripts/rollback.sh` | `./scripts/rollback.sh user/task-tracker:oldtag`: redeploys an earlier version |
+| `scripts/deploy.sh` | Legacy local Docker Compose helper; production deploys use Terraform and ECS |
+| `scripts/rollback.sh` | Legacy local rollback helper; production rollback uses an earlier ECR tag |
 | `scripts/status.sh` | Container state, health, deployed image, `/version`, last logs |
 | `scripts/logs.sh` | `follow`, `errors`, `slow`, `last N` |
 | `scripts/smoke-test.sh` | Creates, lists and deletes a task through the API to prove the deployment works |
@@ -225,11 +228,11 @@ docker ps    # STATUS column shows "healthy"
 curl http://SERVER_IP/version
 ```
 
-**Continuous health monitoring:** `health-monitor.yml` checks `/health` and `/version` on the live server every 30 minutes and fails (with email) if the app is unreachable. For 5-minute checks and a status page add a free UptimeRobot monitor.
+**Continuous health monitoring:** `health-monitor.yml` checks `/health` and `/version` on the ECS Application Load Balancer every 30 minutes and fails if the app is unreachable.
 
 ## 12. Rollback strategy
-- **Automatic:** if the new container is not healthy within 60 seconds, `deploy.sh` restores the previously recorded image.
-- **Manual:** `./scripts/rollback.sh DOCKERHUB_USER/task-tracker:<previous-sha>`. Every build is stored in Docker Hub under its commit SHA, so any earlier version can be restored.
+- **Automatic:** ECS replaces tasks that fail container or load balancer health checks.
+- **Manual:** update `infra` with an earlier ECR image tag and run `terraform apply`.
 
 ## 13. Security practices
 | Practice | Implementation |
@@ -238,22 +241,20 @@ curl http://SERVER_IP/version
 | Least privilege workflow | `permissions: contents: read` |
 | Image hardening | Non-root user, minimal Alpine base, multi-stage, read-only filesystem, dropped capabilities |
 | Vulnerability scanning | Trivy on every build (set `exit-code: "1"` to block on findings) |
-| Dedicated deploy key | Separate SSH key just for deployment; restrict port 22 to known IPs |
+| Short-lived AWS credentials | GitHub Actions uses AWS OIDC; no long-lived access key or SSH key is stored |
 | Production approval | Optional required reviewers on the `production` environment |
-| Token scope | Docker Hub token instead of password |
+| IAM scope | The deployment role is limited to ECR push, ECS deployment, and the task execution role |
 
 ## 14. Jenkins alternative
-`jenkins/Jenkinsfile` implements the same stages (Test, Build, Smoke test, Push, Deploy). Install Jenkins with Docker and NodeJS available, add credentials `dockerhub-creds` and `server-ssh`, set `SERVER_HOST` and `SERVER_USER`, and create a Pipeline job pointing at this repository. GitHub Actions is the primary pipeline for this submission.
+`jenkins/Jenkinsfile` is retained as an alternative for teams that already operate Jenkins. GitHub Actions with OIDC is the recommended pipeline.
 
 ## 15. Troubleshooting
 | Problem | Fix |
 |---|---|
-| `denied: requested access to the resource is denied` on push | Check `DOCKERHUB_USERNAME`/`TOKEN`; repository name must match `task-tracker` |
+| ECR push is denied | Check the AWS role trust policy, region, and ECR permissions |
 | Deploy job skipped | Set repository variable `DEPLOY_ENABLED=true`; only runs on `main` |
-| `Permission denied (publickey)` | Public key must be in the server's `~/.ssh/authorized_keys`; secret must contain the full private key including header/footer lines |
-| Site unreachable | Open port 80 in the cloud security group; check `docker ps` |
-| Deployment rolled back | Run `docker logs task-tracker`; fix, push again |
-| Port 80 already in use on server | Set `HOST_PORT=8080` and open that port |
+| Site unreachable | Check ALB target health and ECS service events in AWS |
+| Deployment failed | Inspect the `/ecs/task-tracker` CloudWatch log group and ECS service events |
 | Trivy reports vulnerabilities | Update the base image tag or dependencies; they are informational by default |
 
 ## 16. Task completion checklist
@@ -262,8 +263,8 @@ curl http://SERVER_IP/version
 | 1 | Sample web application | Done | `app/` |
 | 2 | GitHub Actions / Jenkins pipeline | Done (both provided) | `.github/workflows/`, `jenkins/` |
 | 3 | Automated build and testing | Done | stages 1-2 in `ci-cd.yml` |
-| 4 | Deploy with Docker containers | Done | `Dockerfile`, `docker-compose.yml`, `scripts/deploy.sh` |
-| 5 | Docker Hub integration | Done; **you add your Docker Hub credentials** | stage 3, section 9.1 |
+| 4 | Deploy with AWS containers | Done | `infra/`, `.github/workflows/ci-cd.yml` |
+| 5 | Amazon ECR integration | Done; **you bootstrap the AWS role and configure GitHub secrets** | stage 3, section 9.1 |
 | 6 | Monitor logs and deployment status | Done | Section 11 |
 | 7 | Document CI/CD workflow | Done | This README, `docs/REPORT.md` |
 
@@ -286,7 +287,7 @@ Save with these names in `docs/screenshots/`:
 | 2 | `02-tests-passing.png` | Local or Actions test output |
 | 3 | `03-pipeline-success.png` | Actions run graph, all stages green |
 | 4 | `04-test-summary.png` | Job summary with test results |
-| 5 | `05-docker-hub.png` | Docker Hub repository with tags |
+| 5 | `05-ecr.png` | Amazon ECR repository with tags |
 | 6 | `06-trivy-scan.png` | Scan step output |
 | 7 | `07-deploy-log.png` | Deploy job log showing health check success |
 | 8 | `08-docker-ps.png` | `docker ps` on server showing `healthy` |
@@ -298,12 +299,12 @@ Save with these names in `docs/screenshots/`:
 **Demonstrating rollback (good evidence):** push a commit that breaks `/health` (for example return status 500), let the pipeline deploy it, and screenshot the log showing "Deployment FAILED ... Rolling back". Then revert the commit.
 
 ## 19. Setup checklist before submitting
-- [ ] Replace `YOUR NAME`, `USERNAME`, `DOCKERHUB_USER`, `YOUR_SERVER_IP`, `YOUR_DOCKERHUB_USER` (`grep -rn "YOUR\|USERNAME\|DOCKERHUB_USER" .`)
-- [ ] Repo named `cognevance_cicd-pipeline-automation` and pushed
-- [ ] Docker Hub repo created; secrets added; pipeline green
-- [ ] (Optional but best) server running; `DEPLOY_ENABLED=true`; app reachable
+- [ ] Replace `YOUR NAME`, `USERNAME`, and `YOUR_ALB_DNS`
+- [ ] AWS role and ECR/ECS infrastructure bootstrapped with Terraform
+- [ ] GitHub OIDC secret and ALB URL configured; pipeline green
+- [ ] `DEPLOY_ENABLED=true`; app reachable through the ALB
 - [ ] Screenshots added; `docs/REPORT.md` completed
-- [ ] Email repo link, Docker Hub link and your experience/review to support@cognevance.online
+- [ ] Email repo link, AWS deployment URL and your experience/review to support@cognevance.online
 
 ## 20. Lessons learned and future improvements
 - Building and smoke-testing the image *before* pushing prevents broken images reaching the registry.

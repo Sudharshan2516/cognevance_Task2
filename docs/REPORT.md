@@ -7,7 +7,7 @@
 | Domain / Level | Cloud Computing & DevOps, Level 2 (Intermediate) |
 | Date | DD Month 2026 |
 | Repository | https://github.com/USERNAME/cognevance_cicd-pipeline-automation |
-| Docker Hub | https://hub.docker.com/r/DOCKERHUB_USER/task-tracker |
+| AWS deployment | Amazon ECR + ECS Fargate |
 
 ## 1. Introduction
 Manual build and deployment is slow and error-prone. This project automates the full path from source code to a running container using CI/CD, so every change is tested, packaged, published and deployed consistently.
@@ -16,7 +16,7 @@ Manual build and deployment is slow and error-prone. This project automates the 
 Create a sample web app; configure a pipeline; automate build and test; deploy with Docker; integrate a container registry; monitor logs and status; document the workflow.
 
 ## 3. Tools and technologies
-Node.js, Express, Docker, Docker Compose, GitHub Actions, Jenkins (alternative), Docker Hub, Trivy, Bash, SSH, AWS EC2 (or your server).
+Node.js, Express, Docker, GitHub Actions, Jenkins (alternative), Amazon ECR, ECS Fargate, Terraform, Trivy, Bash, CloudWatch.
 
 ## 4. Implementation
 ### 4.1 Application
@@ -29,10 +29,10 @@ Node.js, Express, Docker, Docker Compose, GitHub Actions, Jenkins (alternative),
 (Explain the multi-stage Dockerfile, non-root user, health check, Compose hardening.)
 
 ### 4.4 Registry
-(Docker Hub repository, tagging strategy: commit SHA, latest, release tags.)
+(Amazon ECR repository and commit-SHA image tagging strategy.)
 
 ### 4.5 Deployment and rollback
-(Describe `deploy.sh`, health-gated release and automatic rollback.)
+(Describe the ECS service, ALB health checks, CloudWatch logs, and ECR-tag rollback.)
 
 ### 4.6 Monitoring
 (Pipeline status, job summaries, JSON logs, `status.sh`, health monitor workflow.)
@@ -49,8 +49,8 @@ Node.js, Express, Docker, Docker Compose, GitHub Actions, Jenkins (alternative),
 ## 6. Challenges and solutions
 | Challenge | Solution |
 |---|---|
-| (e.g. SSH permission denied) | (e.g. added public key to authorized_keys) |
-| (e.g. Docker Hub login failed) | (e.g. regenerated access token) |
+| (e.g. ECR permission denied) | (e.g. corrected the GitHub OIDC role trust policy) |
+| (e.g. ECS task failed health checks) | (e.g. inspected CloudWatch logs and service events) |
 
 ## 7. Conclusion
 (2-4 sentences.)

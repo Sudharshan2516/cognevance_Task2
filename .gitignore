@@ -3,3 +3,7 @@ node_modules/
 .deployed_image
 coverage/
 *.log
+infra/.terraform/
+infra/*.tfstate
+infra/*.tfstate.*
+infra/.terraform.lock.hcl

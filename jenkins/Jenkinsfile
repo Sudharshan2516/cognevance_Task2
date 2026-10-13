@@ -1,37 +1,40 @@
-// Alternative to GitHub Actions. Requires Jenkins with Docker, NodeJS and credentials:
-//   dockerhub-creds (username/password), server-ssh (SSH key), plus env SERVER_HOST / SERVER_USER
+// Alternative to GitHub Actions. Requires Jenkins with Docker, NodeJS, Terraform,
+// AWS CLI, and an Amazon Web Services credential named aws-deploy.
 pipeline {
   agent any
   environment {
-    IMAGE = "YOUR_DOCKERHUB_USER/task-tracker"
+    AWS_REGION = "us-east-1"
+    ECR_REPOSITORY = "task-tracker"
     TAG   = "${env.GIT_COMMIT.take(7)}"
   }
   stages {
     stage('Test')  { steps { dir('app') { sh 'npm install && npm run lint && npm test' } } }
-    stage('Build') { steps { sh 'docker build -t $IMAGE:$TAG -t $IMAGE:latest --build-arg GIT_SHA=$GIT_COMMIT .' } }
+    stage('Build') { steps { sh 'docker build -t task-tracker:$TAG --build-arg GIT_SHA=$GIT_COMMIT .' } }
     stage('Smoke test') {
       steps {
         sh '''
-          docker run -d --name ci-app -p 3001:3000 $IMAGE:$TAG
+          docker run -d --name ci-app -p 3001:3000 task-tracker:$TAG
           sleep 5; ./scripts/smoke-test.sh http://localhost:3001
         '''
       }
       post { always { sh 'docker rm -f ci-app || true' } }
     }
-    stage('Push') {
+    stage('Push to ECR') {
       steps {
-        withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'U', passwordVariable: 'P')]) {
-          sh 'echo $P | docker login -u $U --password-stdin && docker push $IMAGE:$TAG && docker push $IMAGE:latest'
-        }
-      }
-    }
-    stage('Deploy') {
-      when { branch 'main' }
-      steps {
-        sshagent(['server-ssh']) {
+        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-deploy']]) {
           sh '''
-            scp -o StrictHostKeyChecking=no -r docker-compose.yml scripts $SERVER_USER@$SERVER_HOST:~/task-tracker/
-            ssh -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_HOST "cd ~/task-tracker && IMAGE=$IMAGE:$TAG ./scripts/deploy.sh"
+            ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+            REGISTRY="$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+            aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$REGISTRY"
+            docker tag task-tracker:$TAG "$REGISTRY/$ECR_REPOSITORY:$TAG"
+            docker push "$REGISTRY/$ECR_REPOSITORY:$TAG"
+            export IMAGE_URI="$REGISTRY/$ECR_REPOSITORY:$TAG"
+            terraform -chdir=infra init -input=false
+            terraform -chdir=infra apply -auto-approve -input=false \
+              -var="aws_region=$AWS_REGION" \
+              -var="github_repository=$GIT_URL" \
+              -var="image_uri=$IMAGE_URI"
+            aws ecs wait services-stable --cluster "$ECR_REPOSITORY" --services "$ECR_REPOSITORY"
           '''
         }
       }
